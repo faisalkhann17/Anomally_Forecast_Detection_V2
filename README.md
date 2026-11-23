@@ -46,4 +46,20 @@ minus 30%. Tune with `FLOW_SUGGESTION_MARGIN_PERCENT` (30),
 `FLOW_SUGGESTION_OUTLIER_WARNING_PERCENT` (20) and
 `FLOW_SUGGESTION_LOOKBACK_DAYS` (`7,30`).
 
+## Versions and releases
+
+The running version is in `backend/__init__.py` (`__version__`) and is shown at
+`GET /` and in `/docs`. Changes are listed in `CHANGELOG.md`, and each release
+commit is tagged `vMAJOR.MINOR.PATCH`.
+
+To release:
+
+1. Update `__version__` in `backend/__init__.py`.
+2. Add the changes to `CHANGELOG.md` under the new version and date.
+3. Commit, then tag and push: `git tag -a v1.1.0 -m "v1.1.0"` and `git push origin main --tags`.
+
+On the server, deploy a specific version with `git fetch --tags` and
+`git checkout v1.1.0`, then restart. To roll back, check out the previous tag
+and restart. `.env` and the model folder are not tracked, so they are kept.
+
 See `backend/README.md` for the code layout.

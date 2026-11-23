@@ -12,7 +12,6 @@ class Settings(BaseSettings):
     """Load runtime settings from environment variables with safe defaults."""
     # API Settings
     API_TITLE: str = "PumpWatch Predictive Maintenance API"
-    API_VERSION: str = "1.0.0"
     
     # InfluxDB Settings
     INFLUXDB_URL: str = os.getenv("INFLUXDB_URL", "")

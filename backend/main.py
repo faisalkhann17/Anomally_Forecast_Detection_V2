@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 import asyncio
 
+from backend import __version__
 from backend.config import settings
 from backend.api.routes import admin, pumps, profiles
 from backend.workers.prediction_worker import worker_instance
@@ -13,7 +14,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | 
 
 app = FastAPI(
     title=settings.API_TITLE,
-    version=settings.API_VERSION,
+    version=__version__,
     description="Backend for Pump Predictive Maintenance Dashboard"
 )
 
@@ -62,7 +63,7 @@ async def root():
     """Return basic API identity and version information."""
     return {
         "service": "PumpWatch Predictive Maintenance API",
-        "version": settings.API_VERSION,
+        "version": __version__,
         "docs_url": "/docs",
         "health_check": "/health"
     }
