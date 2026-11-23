@@ -1,0 +1,21 @@
+# Local secrets (keep the *.example template)
+.env
+.env.*
+!.env.example
+
+# Model weights: too large for Git; download them (see README)
+backend/artifacts/timestral/checkpoints/
+
+# Local runtime state (rebuilt automatically; profiles live in MongoDB)
+backend/artifacts/pump_profiles.json
+backend/artifacts/electrical_maintenance_baselines.json
+
+# Logs and caches
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+.ruff_cache/
+.venv/
+venv/
