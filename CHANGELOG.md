@@ -4,6 +4,13 @@ All notable changes to the PumpWatch backend. Versions follow
 [Semantic Versioning](https://semver.org/): MAJOR for breaking API or
 configuration changes, MINOR for new features, PATCH for fixes.
 
+## [1.1.1] - 2026-11-24
+
+### Admin access
+- `API_KEY_REQUIRED=false` lets the profile and admin routes work without an
+  `X-API-Key` (the dashboard shows the admin setup to admins only). Changes made this
+  way are recorded as `admin`. The default stays `true` (key required).
+
 ## [1.1.0] - 2026-11-24
 
 ### Production safety and load

@@ -39,7 +39,9 @@ async def startup_event():
     """Load stored profiles, discover pump IDs, then start forecast/maintenance loops."""
     if settings.AUTH_DISABLED_FOR_DEV:
         logging.getLogger(__name__).warning("AUTH_DISABLED_FOR_DEV is enabled; protected routes are open.")
-    if not settings.ADMIN_API_KEY or not (settings.ENGINEER_API_KEY or settings.ENGINEER_API_KEYS):
+    if not settings.API_KEY_REQUIRED:
+        logging.getLogger(__name__).warning("API_KEY_REQUIRED is false; profile and admin routes need no API key.")
+    elif not settings.ADMIN_API_KEY or not (settings.ENGINEER_API_KEY or settings.ENGINEER_API_KEYS):
         logging.getLogger(__name__).warning("One or more API keys are missing; affected protected routes fail closed.")
     try:
         # Warm the in-memory copy so live checks survive a later MongoDB outage.

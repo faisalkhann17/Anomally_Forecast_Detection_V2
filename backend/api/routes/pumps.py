@@ -198,7 +198,7 @@ async def get_pump_prediction(
 ):
     """Serve cached current/forecast state; only keyed refresh requests fetch again."""
     from backend.workers.prediction_worker import worker_instance
-    if refresh and (x_api_key or settings.AUTH_DISABLED_FOR_DEV):
+    if refresh and (x_api_key or settings.AUTH_DISABLED_FOR_DEV or not settings.API_KEY_REQUIRED):
         authorize(request, x_api_key, "engineer")
     elif refresh:
         refresh = False

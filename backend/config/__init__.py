@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     ENGINEER_API_KEY: str = ""
     ENGINEER_API_KEYS: str = ""
     AUTH_DISABLED_FOR_DEV: bool = False
+    # false: profile/admin routes need no X-API-Key (the dashboard shows them to admins only).
+    API_KEY_REQUIRED: bool = True
     PROTECTED_RATE_LIMIT_PER_MINUTE: int = 60
     FAILED_AUTH_RATE_LIMIT_PER_MINUTE: int = 20
     # One background job refreshes the forecast and the slow-wear checks together.

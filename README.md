@@ -61,6 +61,7 @@ PROFILE_MONGODB_ALLOW_REMOTE=true    # profiles and issue history on the MongoDB
 FORECAST_HISTORY_DAYS=30
 MAINTENANCE_HISTORY_DAYS=30
 FORECAST_REFRESH_MINUTES=720         # forecast + slow-wear every 12 hours
+API_KEY_REQUIRED=false               # profile/admin routes without an API key
 ```
 
 Run a single worker (`--workers 1`): the background job runs inside the process.

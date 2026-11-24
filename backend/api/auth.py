@@ -54,6 +54,8 @@ def authorize(request: Request, api_key: str | None, role: str) -> str:
     """Authenticate a key, enforce role access and return its identity label."""
     if settings.AUTH_DISABLED_FOR_DEV:
         identity = "dev"
+    elif not settings.API_KEY_REQUIRED:
+        identity = "admin"
     else:
         admin_key = settings.ADMIN_API_KEY
         engineer_key = settings.ENGINEER_API_KEY
