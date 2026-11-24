@@ -3,6 +3,7 @@
 import logging
 import json
 import math
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from threading import Lock
@@ -77,6 +78,54 @@ class InfluxService:
         """Encode a value safely for insertion into a Flux string literal."""
         return json.dumps(str(value))
 
+    @staticmethod
+    def _time_offset() -> timedelta:
+        """How far stored telemetry _time runs ahead of real UTC (INFLUX_TIME_OFFSET_MINUTES)."""
+        return timedelta(minutes=int(settings.INFLUX_TIME_OFFSET_MINUTES or 0))
+
+    def _range(self, start, stop=None) -> str:
+        """Build a telemetry Flux range in real time, shifted to the stored clock.
+
+        ``start``/``stop`` are relative strings ("-1h", "-90m", "-7d", "now()"),
+        "0", or UTC datetimes. With no offset the range is written exactly as given.
+        With an offset every bound moves by it, so "-1h" still means the last real
+        hour and packets stamped further in the future (bad device clocks) are left out.
+        """
+        offset = self._time_offset()
+        if not offset:
+            def plain(value):
+                return value.strftime("%Y-%m-%dT%H:%M:%SZ") if isinstance(value, datetime) else str(value)
+            return f"range(start: {plain(start)})" if stop is None else f"range(start: {plain(start)}, stop: {plain(stop)})"
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+
+        def shifted(value) -> str:
+            if isinstance(value, datetime):
+                moment = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            else:
+                text = str(value).strip()
+                if text == "0":
+                    return "0"
+                if text == "now()":
+                    moment = now
+                else:
+                    match = re.fullmatch(r"-(\d+)([smhd])", text)
+                    if not match:
+                        return text
+                    unit = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}[match.group(2)]
+                    moment = now - timedelta(**{unit: int(match.group(1))})
+            return (moment.astimezone(timezone.utc) + offset).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        return f"range(start: {shifted(start)}, stop: {shifted('now()' if stop is None else stop)})"
+
+    def _real_time(self, values):
+        """Convert stored telemetry _time (a value, Series or column) to real UTC."""
+        offset = self._time_offset()
+        if not offset or values is None:
+            return values
+        if isinstance(values, pd.Series):
+            return pd.to_datetime(values, utc=True, errors="coerce") - offset
+        return values - offset
+
     def _get_client(self) -> InfluxDBClient:
         """Create a validated short-lived InfluxDB client."""
         if not self.url:
@@ -94,7 +143,7 @@ class InfluxService:
         """
         query = f'''
         from(bucket: {self._flux_string(self.bucket)})
-          |> range(start: 0)
+          |> {self._range("0")}
           |> filter(fn: (r) => r._measurement == {self._flux_string(self.measurement)})
           |> filter(fn: (r) => r._field == "current_r")
           |> filter(fn: (r) => exists r.product_id)
@@ -125,7 +174,7 @@ class InfluxService:
         """
         query = f'''
         from(bucket: {self._flux_string(self.bucket)})
-          |> range(start: {start}, stop: {stop})
+          |> {self._range(start, stop)}
           |> filter(fn: (r) => r._measurement == {self._flux_string(self.measurement)})
         '''
         if pump_id:
@@ -148,7 +197,7 @@ class InfluxService:
             for table in tables:
                 for row in table.records:
                     records.append({
-                        "_time": row.get_time(),
+                        "_time": self._real_time(row.get_time()),
                         "_field": row.get_field(),
                         "_value": row.get_value(),
                         "product_id": row.values.get("product_id"),
@@ -172,7 +221,7 @@ class InfluxService:
         """
         query = f'''
         from(bucket: {self._flux_string(self.bucket)})
-          |> range(start: -{int(days)}d)
+          |> {self._range(f"-{int(days)}d")}
           |> filter(fn: (r) => r._measurement == {self._flux_string(self.measurement)})
           |> filter(fn: (r) => r.product_id == {self._flux_string(pump_id)})
           |> filter(fn: (r) => r._field == "flowrate")
@@ -213,7 +262,7 @@ class InfluxService:
                 chunk_stop = min(chunk_start + timedelta(days=1), stop)
                 query = f'''
                 from(bucket: {self._flux_string(self.bucket)})
-                  |> range(start: {chunk_start.strftime("%Y-%m-%dT%H:%M:%SZ")}, stop: {chunk_stop.strftime("%Y-%m-%dT%H:%M:%SZ")})
+                  |> {self._range(chunk_start, chunk_stop)}
                   |> filter(fn: (r) => r._measurement == {self._flux_string(self.measurement)} and r.product_id == {self._flux_string(pump_id)})
                   |> filter(fn: (r) => {field_filter})
                   |> group(columns: ["_field", "pump_status"])
@@ -222,7 +271,7 @@ class InfluxService:
                 try:
                     tables = query_api.query(query=query)
                     records.extend(
-                        {"_time": record.get_time(), "_field": record.get_field(), "_value": record.get_value(),
+                        {"_time": self._real_time(record.get_time()), "_field": record.get_field(), "_value": record.get_value(),
                          "product_id": pump_id, "pump_status": record.values.get("pump_status")}
                         for table in tables for record in table.records
                     )
@@ -291,7 +340,7 @@ class InfluxService:
             for day in range(int(days), 0, -1):
                 query = f'''
                 from(bucket: {self._flux_string(self.bucket)})
-                  |> range(start: -{day}d, stop: -{day - 1}d)
+                  |> {self._range(f"-{day}d", f"-{day - 1}d")}
                   |> filter(fn: (r) => r._measurement == {self._flux_string(self.measurement)} and r.product_id == {self._flux_string(pump_id)})
                   |> filter(fn: (r) => r.pump_status == "on" or r.pump_status == "ON" or r.pump_status == "running" or r.pump_status == "RUNNING")
                   |> filter(fn: (r) => {field_filter})
@@ -300,7 +349,7 @@ class InfluxService:
                 '''
                 try:
                     tables = query_api.query(query=query)
-                    records.extend((record.get_time(), record.get_field(), record.get_value()) for table in tables for record in table.records)
+                    records.extend((self._real_time(record.get_time()), record.get_field(), record.get_value()) for table in tables for record in table.records)
                     read += 1
                 except Exception:
                     failed += 1
@@ -333,7 +382,7 @@ class InfluxService:
             return self.get_latest_status_row(pump_id)
         query = f'''
         from(bucket: {self._flux_string(self.bucket)})
-          |> range(start: {start})
+          |> {self._range(start)}
           |> filter(fn: (r) => r._measurement == {self._flux_string(self.measurement)})
           |> filter(fn: (r) => r.product_id == {self._flux_string(pump_id)})
           |> last()
@@ -347,7 +396,7 @@ class InfluxService:
             for table in result:
                 for row in table.records:
                     return {
-                        "_time": row.get_time(),
+                        "_time": self._real_time(row.get_time()),
                         "product_id": row.values.get("product_id"),
                         "operation_mode": row.values.get("operation_mode"),
                         "pump_health": row.values.get("pump_health"),
@@ -442,7 +491,7 @@ class InfluxService:
         )
         query = f'''
         from(bucket: {self._flux_string(self.bucket)})
-          |> range(start: {_start})
+          |> {self._range(_start)}
           |> filter(fn: (r) => r._measurement == {self._flux_string(self.measurement)})
           |> filter(fn: (r) => r.product_id == {self._flux_string(pump_id)})
           |> filter(fn: (r) => r.pump_status == "on" or r.pump_status == "ON" or r.pump_status == "running" or r.pump_status == "RUNNING")
@@ -492,7 +541,7 @@ class InfluxService:
 
             if '_time' in wide_df.columns:
                 # Need to convert string/timestamp to proper timezone-aware datetime before rounding
-                wide_df['_time'] = pd.to_datetime(wide_df['_time'], utc=True).dt.round('s')
+                wide_df['_time'] = self._real_time(pd.to_datetime(wide_df['_time'], utc=True)).dt.round('s')
                 
             wide_df = wide_df.sort_values("_time").drop_duplicates("_time", keep="last")
             if limit:
@@ -516,7 +565,7 @@ class InfluxService:
         limit_clause = f'\n          |> limit(n: {int(limit)})' if limit else ""
         query = f'''
         from(bucket: {self._flux_string(self.bucket)})
-          |> range(start: {start})
+          |> {self._range(start)}
           |> filter(fn: (r) => r._measurement == {self._flux_string(self.measurement)})
           |> filter(fn: (r) => r.product_id == {self._flux_string(pump_id)})
           |> filter(fn: (r) => ({required}))
@@ -556,7 +605,7 @@ class InfluxService:
                 elif column == "pump_status":
                     wide_df[column] = 'unknown'
 
-            wide_df['_time'] = pd.to_datetime(wide_df['_time'], utc=True, errors='coerce').dt.round('s')
+            wide_df['_time'] = self._real_time(pd.to_datetime(wide_df['_time'], utc=True, errors='coerce')).dt.round('s')
             wide_df = wide_df.dropna(subset=['_time']).sort_values('_time').drop_duplicates('_time', keep='last')
             if limit:
                 wide_df = wide_df.tail(limit)

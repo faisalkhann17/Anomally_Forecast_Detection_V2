@@ -4,6 +4,18 @@ All notable changes to the PumpWatch backend. Versions follow
 [Semantic Versioning](https://semver.org/): MAJOR for breaking API or
 configuration changes, MINOR for new features, PATCH for fixes.
 
+## [1.1.2] - 2026-11-25
+
+### Fixed
+- Live readings were about 5.5 hours old on the production server. Its devices write
+  IST wall-clock time into InfluxDB labelled as UTC, so the stored `_time` runs
+  5h30m ahead of real time, and windows such as "last 1 hour" up to `now()` returned
+  readings from 5.5 hours earlier. New setting `INFLUX_TIME_OFFSET_MINUTES` (default
+  0; production 330): every telemetry query window moves by the offset and every
+  reading's time is converted back to real UTC, so live state, data age, charts,
+  history and limit suggestions use real time. Packets whose device clock is even
+  further ahead are left out.
+
 ## [1.1.1] - 2026-11-24
 
 ### Admin access

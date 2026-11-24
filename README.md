@@ -62,6 +62,7 @@ FORECAST_HISTORY_DAYS=30
 MAINTENANCE_HISTORY_DAYS=30
 FORECAST_REFRESH_MINUTES=720         # forecast + slow-wear every 12 hours
 API_KEY_REQUIRED=false               # profile/admin routes without an API key
+INFLUX_TIME_OFFSET_MINUTES=330       # devices write IST time labelled as UTC
 ```
 
 Run a single worker (`--workers 1`): the background job runs inside the process.

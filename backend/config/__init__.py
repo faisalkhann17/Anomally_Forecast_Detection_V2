@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     INFLUXDB_ORG: str = os.getenv("INFLUXDB_ORG", "Aquasense")
     INFLUXDB_BUCKET: str = os.getenv("INFLUXDB_BUCKET", "Flowmeter_Data_Influx")
     INFLUXDB_MEASUREMENT: str = os.getenv("INFLUXDB_MEASUREMENT", "atbc_packet")
+    # Minutes the stored telemetry _time runs ahead of real UTC. 330 when devices write
+    # IST wall-clock time labelled as UTC; 0 when they write real UTC.
+    INFLUX_TIME_OFFSET_MINUTES: int = int(os.getenv("INFLUX_TIME_OFFSET_MINUTES", "0"))
 
     SHORT_CYCLING_LOOKBACK_MINUTES: int = int(os.getenv("SHORT_CYCLING_LOOKBACK_MINUTES", "60"))
     SHORT_CYCLING_MAX_STARTS: int = int(os.getenv("SHORT_CYCLING_MAX_STARTS", "4"))
