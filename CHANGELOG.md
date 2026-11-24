@@ -4,6 +4,31 @@ All notable changes to the PumpWatch backend. Versions follow
 [Semantic Versioning](https://semver.org/): MAJOR for breaking API or
 configuration changes, MINOR for new features, PATCH for fixes.
 
+## [1.1.0] - 2026-11-24
+
+### Production safety and load
+- `INFLUX_WRITES_ENABLED=false` keeps the service read-only on InfluxDB; the hourly
+  forecast history is kept in memory instead.
+- `PROFILE_MONGODB_ALLOW_REMOTE=true` allows engineer profiles and issue history on a
+  remote MongoDB server (local-only by default).
+- The forecast and the slow-wear checks now run as one background job every 12 hours
+  (`FORECAST_REFRESH_MINUTES=720`) and share one history read per pump.
+- History is read one day per query, only the needed fields, one reading per
+  5 minutes, with a short pause between queries; later cycles read only new data.
+  Days that InfluxDB cannot return are skipped instead of failing the pump.
+
+### Engineer limits
+- `GET /api/pumps/{id}/profile/limit-suggestion`: suggests nameplate values and limits
+  from the pump's last 30 days of running data, with warnings and the alarms the
+  limits would have raised. Nothing is saved; the engineer reviews and saves.
+- "Check minimum flow from data" no longer fails when meters send text readings such
+  as "-".
+- The dashboard "usual value / usual range" now shows the approved limits (approx).
+
+### Dashboard
+- While a pump is off, the dashboard returns its last running readings and health
+  score (`last_run`); `last_on_timestamp` is the real last running time.
+
 ## [1.0.0] - 2026-11-23
 
 First tagged release.

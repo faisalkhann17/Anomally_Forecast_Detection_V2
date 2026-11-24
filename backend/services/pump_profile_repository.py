@@ -132,8 +132,9 @@ class MongoPumpProfileRepository:
                  *, history_collection: str = "pumpwatch_profile_history") -> None:
         """Validate the local MongoDB URI and name the profile and history collections."""
         parsed = urlsplit(uri)
-        if parsed.scheme != "mongodb" or parsed.hostname not in {"localhost", "127.0.0.1", "::1"} or "," in parsed.netloc:
-            raise ValueError("Profile MongoDB URI must point to a single local loopback host.")
+        remote_ok = settings.PROFILE_MONGODB_ALLOW_REMOTE
+        if parsed.scheme != "mongodb" or "," in parsed.netloc or (not remote_ok and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}):
+            raise ValueError("Profile MongoDB URI must point to a single local loopback host (set PROFILE_MONGODB_ALLOW_REMOTE=true for a remote server).")
         self._uri = uri
         self._database = database
         self._collection_name = collection

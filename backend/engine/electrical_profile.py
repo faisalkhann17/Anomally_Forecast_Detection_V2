@@ -238,6 +238,35 @@ def current_faults(row: pd.Series, profile: dict) -> list[dict]:
     return faults
 
 
+def approved_limit_ranges(profile: dict | None) -> dict:
+    """Dashboard "usual" ranges taken from the engineer-approved limits.
+
+    Each range is the approved min-max; the usual value is the middle of it. They are
+    approximate guides, not measured history. Flow has only a minimum.
+    """
+    limits = (profile or {}).get("operating_limits") or {}
+
+    def spec(low, high):
+        low = float(low) if low is not None else None
+        high = float(high) if high is not None else None
+        middle = (low + high) / 2 if low is not None and high is not None else None
+        return {"median": middle, "p05": low, "p95": high, "expected_low": low, "expected_high": high,
+                "available": low is not None or high is not None, "source": "approved_limits"}
+
+    if not limits:
+        return {}
+    current = spec(limits.get("current_min_a"), limits.get("current_max_a"))
+    voltage = spec(limits.get("voltage_min_v"), limits.get("voltage_max_v"))
+    power_factor = spec(limits.get("power_factor_min"), 1.0)
+    return {
+        "current": {phase: dict(current) for phase in (*PHASES, "avg")},
+        "voltage": {phase: dict(voltage) for phase in (*PHASES, "avg")},
+        "pf": {phase: dict(power_factor) for phase in (*PHASES, "avg")},
+        "power": {"total_kw": spec(limits.get("total_kw_min"), limits.get("total_kw_max"))},
+        "flow": {"flowrate": spec(limits.get("flowrate_min"), None)},
+    }
+
+
 def _severity(value: float, normal: float, critical: float, *, high: bool) -> float:
     """Scale a limit deviation into a bounded zero-to-one severity."""
     if high:

@@ -189,8 +189,10 @@ class MongoIssueEventRepository:
         if not uri:
             raise ValueError("MONGODB_URI is required for issue event persistence.")
         hosts = {host for host, _ in parse_uri(uri)["nodelist"]}
-        if not hosts or not hosts.issubset({"127.0.0.1", "localhost", "::1"}):
-            raise ValueError("Issue event persistence requires a local MongoDB URI.")
+        from backend.config import settings
+
+        if not hosts or (not settings.PROFILE_MONGODB_ALLOW_REMOTE and not hosts.issubset({"127.0.0.1", "localhost", "::1"})):
+            raise ValueError("Issue event persistence requires a local MongoDB URI (set PROFILE_MONGODB_ALLOW_REMOTE=true for a remote server).")
         self.client = MongoClient(
             uri,
             appname="pumpwatch-issue-history",

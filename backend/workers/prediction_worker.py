@@ -10,7 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 from backend.engine.short_cycling import evaluate_short_cycling
-from backend.engine.health_score import HealthSmoother, calculate_smoothed_health, profile_health_baseline
+from backend.engine.health_score import HealthSmoother, calculate_health, calculate_smoothed_health, profile_health_baseline
 from backend.engine.data_quality import (
     data_quality_firewall,
     phase_payload,
@@ -20,7 +20,7 @@ from backend.services.pump_profile_repository import ProfileStoreUnavailable, cr
 from backend.services.maintenance_baseline_repository import MaintenanceBaselineRepository
 from backend.services.issue_event_repository import MongoIssueEventRepository
 from backend.services.timestral_forecasting import TimestralForecastService
-from backend.engine.electrical_profile import current_faults, enriched_frame, forecast_risk
+from backend.engine.electrical_profile import approved_limit_ranges, current_faults, enriched_frame, forecast_risk
 from backend.engine.electrical_maintenance import analyze_electrical_maintenance
 from backend.engine.pump_performance_features import analyze_performance
 from backend.engine.slow_degradation_patterns import analyze_combined_slow_degradation, corroborate_common_supply
@@ -98,6 +98,9 @@ class PredictionWorker:
             self.issue_event_store_error = str(exc)
             logger.warning("Issue event store unavailable: %s", exc)
         self.health_smoother = HealthSmoother(window=5)
+        # Last running readings and health per pump, shown while the pump is off.
+        self.last_runs: dict[str, dict] = {}
+        self._last_run_lookups: dict[str, datetime] = {}
 
     async def initialize_pump(self, pump_id: str, force_enroll: bool = False):
         """Build the first live status payload for a newly discovered pump."""
@@ -186,6 +189,7 @@ class PredictionWorker:
             return
         pump_status = str(latest.get("pump_status") or "").upper()
         if pump_status in {"OFF", "OFFLINE"} or _is_physically_off(latest):
+            await self._restore_last_run(pump_id, profile)
             self._store_profile_result(pump_id, recent_frame, profile, "OFF", data_quality=quality)
             return
         try:
@@ -289,11 +293,11 @@ class PredictionWorker:
         if cached is not None:
             return cached
         try:
-            try:
-                hourly = await asyncio.to_thread(self.influx_service.refresh_hourly_forecast_cache, pump_id, profile)
-            except Exception:
-                logger.exception("Hourly cache unavailable for %s; using the raw-history fallback", pump_id)
-                hourly = await asyncio.to_thread(self.influx_service.get_hourly_forecast_dataframe, pump_id, "-90d", profile)
+            # Same light, shared history as the slow-wear checks (read once per cycle).
+            raw_history = await asyncio.to_thread(
+                self.influx_service.get_history_dataframe, pump_id, settings.FORECAST_HISTORY_DAYS,
+            )
+            hourly = await asyncio.to_thread(self.influx_service.prepare_hourly_forecast_dataframe, raw_history, profile)
             payload = await asyncio.to_thread(self.hourly_timestral.forecast, hourly, profile) if not hourly.empty else {
                 "state": "MODEL_WARMUP",
                 "history_points": 0,
@@ -337,9 +341,7 @@ class PredictionWorker:
         baseline = self.maintenance_baselines.get(pump_id, profile_version)
         try:
             raw_history = await asyncio.to_thread(
-                self.influx_service.get_wide_dataframe,
-                pump_id,
-                f"-{settings.MAINTENANCE_HISTORY_DAYS}d",
+                self.influx_service.get_history_dataframe, pump_id, settings.MAINTENANCE_HISTORY_DAYS,
             )
             hourly = await asyncio.to_thread(
                 self.influx_service.prepare_hourly_forecast_dataframe,
@@ -455,7 +457,11 @@ class PredictionWorker:
         return payload
 
     async def _forecast_schedule(self) -> None:
-        """Refresh approved-pump forecasts without API traffic."""
+        """One background job for approved pumps: forecast, then slow-wear checks.
+
+        Both use the same history, read once per pump per cycle (the second step only
+        reads the few minutes added since the first). Runs every FORECAST_REFRESH_MINUTES.
+        """
         while self.is_running:
             async with self._historical_job_lock:
                 try:
@@ -463,28 +469,48 @@ class PredictionWorker:
                     for pump_id in pump_ids:
                         if not self.is_running:
                             break
-                        try:
-                            await self.refresh_forecast(pump_id)
-                        except Exception:
-                            logger.exception("Forecast job failed for %s; continuing fleet cycle", pump_id)
+                        for step in (self.refresh_forecast, self.refresh_electrical_maintenance):
+                            try:
+                                await step(pump_id)
+                            except Exception:
+                                logger.exception("%s failed for %s; continuing fleet cycle", step.__name__, pump_id)
                 finally:
                     self._first_forecast_cycle_done.set()
             await asyncio.sleep(settings.FORECAST_REFRESH_MINUTES * 60)
 
-    async def _maintenance_schedule(self) -> None:
-        """Refresh slow-degradation maintenance estimates separately from forecasts."""
-        await self._first_forecast_cycle_done.wait()
-        while self.is_running:
-            async with self._historical_job_lock:
-                pump_ids = await self._approved_pump_ids()
-                for pump_id in pump_ids:
-                    if not self.is_running:
-                        break
-                    try:
-                        await self.refresh_electrical_maintenance(pump_id)
-                    except Exception:
-                        logger.exception("Maintenance job failed for %s; continuing fleet cycle", pump_id)
-            await asyncio.sleep(settings.MAINTENANCE_REFRESH_MINUTES * 60)
+    async def _restore_last_run(self, pump_id: str, profile: dict) -> None:
+        """After a restart, rebuild the last run of an off pump from its latest ON readings.
+
+        Uses one small bounded query, at most once an hour per pump, and only when the
+        last run is not already known from this process.
+        """
+        if pump_id in self.last_runs:
+            return
+        now = datetime.now(timezone.utc)
+        checked = self._last_run_lookups.get(pump_id)
+        if checked is not None and (now - checked).total_seconds() < 3600:
+            return
+        self._last_run_lookups[pump_id] = now
+        try:
+            frame = await asyncio.to_thread(self.influx_service.get_latest_live_on_dataframe, pump_id, 30, bounded=True)
+        except Exception:
+            logger.exception("Last run lookup failed for %s", pump_id)
+            return
+        if frame is None or frame.empty:
+            return
+        frame = enriched_frame(frame)
+        frame["_time"] = pd.to_datetime(frame["_time"], utc=True, errors="coerce")
+        frame = frame.dropna(subset=["_time"]).sort_values("_time")
+        if frame.empty:
+            return
+        latest = frame.iloc[-1]
+        faults = current_faults(latest, profile)
+        health = calculate_health(latest, profile_health_baseline(profile), faults, [], [], {}, None,
+                                  "ANOMALY" if faults else "NORMAL", None)
+        if health.get("score") is None:
+            return
+        ended_at = latest["_time"].isoformat()
+        self.last_runs[pump_id] = {"ended_at": ended_at, "current_values": phase_payload(latest), "health": health}
 
     def _store_profile_result(self, pump_id: str, frame: pd.DataFrame, profile: dict | None, state: str, *, detail: str | None = None, data_quality: dict | None = None, data_age_seconds: float | None = None, faults: list[dict] | None = None, cycling: dict | None = None, forecast: dict | None = None, risk: dict | None = None, maintenance: dict | None = None, analysis_reading: pd.Series | None = None, early_warnings: list[dict] | None = None, live_session_rows: int | None = None) -> None:
         """Assemble and cache the complete dashboard state for one pump."""
@@ -531,7 +557,7 @@ class PredictionWorker:
             "engineering_flags": [fault["code"] for fault in faults], "engineering_messages": messages,
             "detected_faults": faults, "baseline_deviations": [], "early_warnings": early_warnings, "short_cycling": cycling or {},
             "model_evidence": None, "informational_status": {}, "current_values": current_values,
-            "baseline_ranges": {}, "data_quality": data_quality or {"status": "SKIPPED"}, "live_context_diagnostics": {},
+            "baseline_ranges": approved_limit_ranges(profile), "data_quality": data_quality or {"status": "SKIPPED"}, "live_context_diagnostics": {},
             "data_quality_warnings": list(dict.fromkeys((data_quality or {}).get("unavailable_fields") or [])) if (data_quality or {}).get("status") == "WARN" else [],
             "baseline_issues": [], "state_reason": detail or (messages[0] if messages else state),
             "data_timestamp": timestamp, "analysis_context": "PROFILE_ENGINEERING", "last_on_timestamp": timestamp,
@@ -545,7 +571,14 @@ class PredictionWorker:
             "forecast": forecast or {"state": "RULES_ONLY"}, "future_electrical_risk": risk,
             "electrical_maintenance": None if state == "STALE_DATA" else maintenance or self._cached_maintenance(pump_id) or {"state": "MAINTENANCE_PENDING", "signals": []},
         }
-        _in_memory_cache[pump_id] = self._in_memory_profile_payload
+        payload = self._in_memory_profile_payload
+        if state in {"NORMAL", "ANOMALY"} and health.get("score") is not None:
+            self.last_runs[pump_id] = {"ended_at": timestamp, "current_values": current_values, "health": health}
+        last_run = self.last_runs.get(pump_id)
+        payload["last_run"] = last_run if state == "OFF" else None
+        if state not in {"NORMAL", "ANOMALY"}:
+            payload["last_on_timestamp"] = (last_run or {}).get("ended_at")
+        _in_memory_cache[pump_id] = payload
         self._record_issue_events(_in_memory_cache[pump_id])
 
     def _record_issue_events(self, payload: dict) -> None:
@@ -588,7 +621,7 @@ class PredictionWorker:
         self.is_running = True
         self._first_forecast_cycle_done.clear()
         self.forecast_task = asyncio.create_task(self._forecast_schedule())
-        self.maintenance_task = asyncio.create_task(self._maintenance_schedule())
+        self.maintenance_task = None  # slow-wear checks now run inside the forecast job
 
     def stop(self):
         """Stop schedules and close worker-owned repositories and executors."""

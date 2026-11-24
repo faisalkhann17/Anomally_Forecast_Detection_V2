@@ -9,7 +9,7 @@ root so `backend.*` imports resolve.
 backend/
 ├── api/         # HTTP routes, response shaping, authentication
 ├── config/      # Environment-based settings
-├── engine/      # Electrical rules, health, data quality, trends, flow suggestion
+├── engine/      # Electrical rules, health, data quality, trends, flow and limit suggestions
 ├── services/    # InfluxDB, MongoDB and Timestral adapters
 ├── workers/     # Realtime refresh and scheduled forecast/maintenance jobs
 ├── artifacts/   # Runtime data and the model checkpoint (not in Git)

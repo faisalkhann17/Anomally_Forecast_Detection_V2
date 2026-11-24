@@ -9,6 +9,7 @@ from backend.api.auth import require_engineer
 from backend.config import settings
 from backend.engine.electrical_profile import profile_limit_warnings, validate_profile
 from backend.engine.flow_suggestion import suggest_minimum_flow
+from backend.engine.limit_suggestion import suggest_limits
 from backend.services.pump_profile_repository import ProfileStoreUnavailable, ProfileUpdateConflict
 from backend.workers.prediction_worker import worker_instance
 
@@ -93,6 +94,27 @@ async def get_profile_history(pump_id: str, limit: int = Query(50, ge=1, le=500)
 
 
 FLOW_SUGGESTION_WINDOW_MINUTES = 5
+
+
+@router.get("/{pump_id}/profile/limit-suggestion")
+async def get_limit_suggestion(pump_id: str, identity: str = Depends(require_engineer)):
+    """Suggest nameplate values and operating limits from the pump's running history (read-only).
+
+    Reads LIMIT_SUGGESTION_DAYS days with one small query per day. Nothing is stored; the
+    admin form fills the values in and the engineer checks them before saving.
+    """
+    days, minutes = settings.LIMIT_SUGGESTION_DAYS, settings.LIMIT_SUGGESTION_SAMPLE_MINUTES
+    try:
+        frame, read, failed = await asyncio.to_thread(
+            worker_instance.influx_service.fetch_running_samples, pump_id, days, minutes,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Could not read the pump history from the database. Try again later.") from exc
+    result = await asyncio.to_thread(
+        suggest_limits, frame, sample_minutes=minutes, days_requested=days, days_read=read,
+        days_failed=failed, min_running_hours=settings.LIMIT_SUGGESTION_MIN_RUNNING_HOURS,
+    )
+    return {"pump_id": pump_id, "calculated_at": datetime.now(timezone.utc).isoformat(), **result}
 
 
 @router.get("/{pump_id}/profile/flow-suggestion")

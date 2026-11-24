@@ -133,6 +133,12 @@ def compact_dashboard_payload(payload: dict, *, include_trends: bool = True) -> 
         "dashboard_label": payload.get("dashboard_label"),
         "analysis_context": payload.get("analysis_context"),
         "last_on_timestamp": payload.get("last_on_timestamp"),
+        # While the pump is off: readings and health from its last run.
+        "last_run": None if not payload.get("last_run") else {
+            "ended_at": payload["last_run"].get("ended_at"),
+            "current_values": _operator_current_values(payload["last_run"].get("current_values")),
+            "health": _operator_health(payload["last_run"].get("health")),
+        },
         "status_timestamp": payload.get("status_timestamp"),
         "current_values": _operator_current_values(payload.get("current_values")),
         "baseline_ranges": payload.get("baseline_ranges") or {},

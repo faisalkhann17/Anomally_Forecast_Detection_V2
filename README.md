@@ -46,6 +46,25 @@ minus 30%. Tune with `FLOW_SUGGESTION_MARGIN_PERCENT` (30),
 `FLOW_SUGGESTION_OUTLIER_WARNING_PERCENT` (20) and
 `FLOW_SUGGESTION_LOOKBACK_DAYS` (`7,30`).
 
+## Calculate limits from data
+
+`GET /api/pumps/{id}/profile/limit-suggestion` reads the pump's last 30 days of running
+data (one small query per day) and suggests rated power, rated current and operating
+limits, with warnings (for example supply voltage outside ±10% or a negative power
+factor) and the alarms those limits would have raised. It saves nothing.
+
+## Production settings
+
+```env
+INFLUX_WRITES_ENABLED=false          # read-only on InfluxDB
+PROFILE_MONGODB_ALLOW_REMOTE=true    # profiles and issue history on the MongoDB server
+FORECAST_HISTORY_DAYS=30
+MAINTENANCE_HISTORY_DAYS=30
+FORECAST_REFRESH_MINUTES=720         # forecast + slow-wear every 12 hours
+```
+
+Run a single worker (`--workers 1`): the background job runs inside the process.
+
 ## Versions and releases
 
 The running version is in `backend/__init__.py` (`__version__`) and is shown at

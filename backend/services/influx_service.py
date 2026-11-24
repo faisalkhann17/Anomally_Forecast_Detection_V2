@@ -3,6 +3,7 @@
 import logging
 import json
 import math
+import time
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 import pandas as pd
@@ -49,6 +50,10 @@ class InfluxService:
         self.org = settings.INFLUXDB_ORG
         self.bucket = settings.INFLUXDB_BUCKET
         self.measurement = settings.INFLUXDB_MEASUREMENT
+        # Per-pump history for the forecast and slow-wear jobs (memory only).
+        self._history_cache: dict[str, dict] = {}
+        # Hourly forecast cache used when INFLUX_WRITES_ENABLED is false (read-only mode).
+        self._memory_hourly_cache: dict[tuple[str, int], pd.DataFrame] = {}
         self.hyphen_fields = {}
         self.live_lookback_minutes = LIVE_LOOKBACK_WINDOWS
         self.status_lookback_minutes = STATUS_LOOKBACK_WINDOWS
@@ -159,7 +164,12 @@ class InfluxService:
             client.close()
 
     def fetch_running_flow(self, pump_id: str, days: int, window_minutes: int = 5) -> list[float]:
-        """Flow readings (median per window) from the times the pump status was ON."""
+        """Flow readings (last value per window) from the times the pump status was ON.
+
+        Production meters sometimes store readings as text (for example "-"), so values
+        are not converted inside InfluxDB (that fails the whole query); they are converted
+        here and anything that is not a number is dropped.
+        """
         query = f'''
         from(bucket: {self._flux_string(self.bucket)})
           |> range(start: -{int(days)}d)
@@ -167,17 +177,144 @@ class InfluxService:
           |> filter(fn: (r) => r.product_id == {self._flux_string(pump_id)})
           |> filter(fn: (r) => r._field == "flowrate")
           |> filter(fn: (r) => r.pump_status == "on" or r.pump_status == "ON" or r.pump_status == "running" or r.pump_status == "RUNNING")
-          |> toFloat()
-          |> group()
-          |> sort(columns: ["_time"])
-          |> aggregateWindow(every: {int(window_minutes)}m, fn: median, createEmpty: false)
+          |> aggregateWindow(every: {int(window_minutes)}m, fn: last, createEmpty: false)
         '''
         client = self._get_client()
         try:
             tables = client.query_api().query(query=query)
-            return [float(record.get_value()) for table in tables for record in table.records if record.get_value() is not None]
+            by_time: dict = {}
+            for table in tables:
+                for record in table.records:
+                    by_time[record.get_time()] = record.get_value()
         finally:
             client.close()
+        values = pd.to_numeric(pd.Series([by_time[key] for key in sorted(by_time)], dtype="object"), errors="coerce")
+        return [float(value) for value in values if pd.notna(value)]
+
+    HISTORY_FIELDS = (*REQUIRED_SENSOR_FIELDS, "total_kwh", "totalizer", "frequency")
+
+    def fetch_history_rows(self, pump_id: str, start: datetime, stop: datetime) -> tuple[pd.DataFrame, int]:
+        """Read history between two times, one day per query, as long rows.
+
+        Only the fields the forecast and slow-wear checks use are read, and InfluxDB
+        returns one reading per HISTORY_SAMPLE_MINUTES for each field and pump status,
+        so each query is small. Queries run one after another with a short pause; a day
+        that fails is skipped (counted in the second return value).
+        """
+        field_filter = " or ".join(f'r._field == "{field}"' for field in self.HISTORY_FIELDS)
+        every = int(settings.HISTORY_SAMPLE_MINUTES)
+        records: list[dict] = []
+        failed = 0
+        client = self._get_client()
+        try:
+            query_api = client.query_api()
+            chunk_start = start
+            while chunk_start < stop:
+                chunk_stop = min(chunk_start + timedelta(days=1), stop)
+                query = f'''
+                from(bucket: {self._flux_string(self.bucket)})
+                  |> range(start: {chunk_start.strftime("%Y-%m-%dT%H:%M:%SZ")}, stop: {chunk_stop.strftime("%Y-%m-%dT%H:%M:%SZ")})
+                  |> filter(fn: (r) => r._measurement == {self._flux_string(self.measurement)} and r.product_id == {self._flux_string(pump_id)})
+                  |> filter(fn: (r) => {field_filter})
+                  |> group(columns: ["_field", "pump_status"])
+                  |> aggregateWindow(every: {every}m, fn: last, createEmpty: false)
+                '''
+                try:
+                    tables = query_api.query(query=query)
+                    records.extend(
+                        {"_time": record.get_time(), "_field": record.get_field(), "_value": record.get_value(),
+                         "product_id": pump_id, "pump_status": record.values.get("pump_status")}
+                        for table in tables for record in table.records
+                    )
+                except Exception:
+                    failed += 1
+                    logger.warning("History for %s from %s could not be read; skipped", pump_id, chunk_start.isoformat())
+                chunk_start = chunk_stop
+                if chunk_start < stop and settings.HISTORY_QUERY_PAUSE_SECONDS:
+                    time.sleep(settings.HISTORY_QUERY_PAUSE_SECONDS)
+        finally:
+            client.close()
+        return pd.DataFrame(records), failed
+
+    def get_history_dataframe(self, pump_id: str, days: int) -> pd.DataFrame:
+        """Wide history of the last ``days`` days for the forecast and slow-wear checks.
+
+        The first call reads the whole period (one small query per day); later calls only
+        read from shortly before the last stored reading, so each 12-hour cycle adds about
+        half a day. The history is kept in memory only; nothing is written to InfluxDB.
+        """
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        oldest = now - timedelta(days=int(days))
+        entry = self._history_cache.get(pump_id)
+        if entry is None or entry["days"] < int(days) or entry["frame"].empty:
+            start, previous = oldest, pd.DataFrame()
+        else:
+            previous = entry["frame"]
+            last = pd.to_datetime(previous["_time"], utc=True).max().to_pydatetime()
+            start = max(oldest, last - timedelta(hours=2))
+        rows, failed = self.fetch_history_rows(pump_id, start, now)
+        fresh = self._wide_from_raw(rows, pump_id) if not rows.empty else pd.DataFrame()
+        frames = [frame for frame in (previous, fresh) if not frame.empty]
+        if frames:
+            merged = pd.concat(frames, ignore_index=True)
+            merged["_time"] = pd.to_datetime(merged["_time"], utc=True)
+            key = ["_time", "pump_status"] if "pump_status" in merged.columns else ["_time"]
+            merged = (merged.drop_duplicates(subset=key, keep="last")
+                      .loc[lambda frame: frame["_time"] >= pd.Timestamp(oldest)]
+                      .sort_values("_time").reset_index(drop=True))
+        else:
+            merged = pd.DataFrame()
+        self._history_cache[pump_id] = {"frame": merged, "days": int(days), "failed_days": failed}
+        logger.info("History for %s: %s rows over %s days (%s day queries skipped)", pump_id, len(merged), days, failed)
+        if merged.empty:
+            return merged
+        return merged.loc[merged["_time"] >= pd.Timestamp(oldest)].reset_index(drop=True)
+
+    LIMIT_SAMPLE_FIELDS = ("current_r", "current_y", "current_b", "voltage_r", "voltage_y", "voltage_b",
+                           "pf_r", "pf_y", "pf_b", "total_kw", "flowrate")
+
+    def fetch_running_samples(self, pump_id: str, days: int, every_minutes: int = 15,
+                              pause_seconds: float = 0.2) -> tuple[pd.DataFrame, int, int]:
+        """Light read of a pump's running history for limit suggestions.
+
+        One small query per day (11 fields, ON time only, one reading per window chosen by
+        InfluxDB), run one after another with a short pause, so the server never gets a
+        large query. Days whose query fails are skipped. Text readings such as "-" become
+        missing values. Returns (wide frame, days read, days failed).
+        """
+        field_filter = " or ".join(f'r._field == "{field}"' for field in self.LIMIT_SAMPLE_FIELDS)
+        records: list[tuple] = []
+        read, failed = 0, 0
+        client = self._get_client()
+        try:
+            query_api = client.query_api()
+            for day in range(int(days), 0, -1):
+                query = f'''
+                from(bucket: {self._flux_string(self.bucket)})
+                  |> range(start: -{day}d, stop: -{day - 1}d)
+                  |> filter(fn: (r) => r._measurement == {self._flux_string(self.measurement)} and r.product_id == {self._flux_string(pump_id)})
+                  |> filter(fn: (r) => r.pump_status == "on" or r.pump_status == "ON" or r.pump_status == "running" or r.pump_status == "RUNNING")
+                  |> filter(fn: (r) => {field_filter})
+                  |> group(columns: ["_field"])
+                  |> aggregateWindow(every: {int(every_minutes)}m, fn: last, createEmpty: false)
+                '''
+                try:
+                    tables = query_api.query(query=query)
+                    records.extend((record.get_time(), record.get_field(), record.get_value()) for table in tables for record in table.records)
+                    read += 1
+                except Exception:
+                    failed += 1
+                    logger.warning("Limit suggestion: day -%s of %s could not be read; skipped", day, pump_id)
+                if pause_seconds:
+                    time.sleep(pause_seconds)
+        finally:
+            client.close()
+        if not records:
+            return pd.DataFrame(), read, failed
+        frame = (pd.DataFrame(records, columns=["_time", "_field", "_value"])
+                 .pivot_table(index="_time", columns="_field", values="_value", aggfunc="last"))
+        frame = frame.apply(pd.to_numeric, errors="coerce").sort_index()
+        return frame, read, failed
 
     def get_latest_status_row(self, pump_id: str, start: str = "0", *, bounded: bool = False) -> dict | None:
         """Fetch the latest telemetry tag row without requiring valid sensor fields."""
@@ -227,7 +364,10 @@ class InfluxService:
         """
         raw_tail = None if on_only else tail_count
         raw_df = self.fetch_raw_data(pump_id, start, stop, raw_tail, on_only=on_only)
-        
+        return self._wide_from_raw(raw_df, pump_id, tail_count)
+
+    def _wide_from_raw(self, raw_df: pd.DataFrame, pump_id: Optional[str], tail_count: Optional[int] = None) -> pd.DataFrame:
+        """Turn long InfluxDB rows (_time, _field, _value, tags) into the wide pipeline frame."""
         if raw_df.empty:
             logger.warning(f"No data returned for pump {pump_id} in measurement '{self.measurement}'.")
             return pd.DataFrame()
@@ -242,10 +382,10 @@ class InfluxService:
         raw_df['_value'] = pd.to_numeric(raw_df['_value'], errors='coerce')
         
         # Tags we want to preserve in the wide format
-        index_cols = ["_time", "product_id", "operation_mode", "pump_health", "pump_status"]
+        # Light history reads carry only pump_status; keep whichever tags are present.
+        index_cols = [col for col in ("_time", "product_id", "operation_mode", "pump_health", "pump_status") if col in raw_df.columns]
         for col in index_cols:
-            if col in raw_df.columns:
-                raw_df[col] = raw_df[col].fillna('unknown')
+            raw_df[col] = raw_df[col].fillna('unknown')
 
         # Safely align staggered timestamps to the nearest second
         raw_df['_time'] = raw_df['_time'].dt.round('s')
@@ -476,6 +616,8 @@ class InfluxService:
 
     def write_hourly_forecast_dataframe(self, pump_id: str, profile_version: int, frame: pd.DataFrame) -> int:
         """Idempotently upsert hourly forecast inputs using pump and hour identity."""
+        if not settings.INFLUX_WRITES_ENABLED:
+            return 0  # read-only mode: never write to InfluxDB
         if frame.empty:
             return 0
         points = []
@@ -521,18 +663,31 @@ class InfluxService:
         """
         profile_version = int(profile.get("version", 0))
         now = pd.Timestamp(datetime.now(timezone.utc))
-        oldest_complete_hour = (now - timedelta(days=90)).ceil("h")
-        cached = self.get_cached_hourly_forecast_dataframe(pump_id, profile_version, "-90d")
+        oldest_complete_hour = (now - timedelta(days=settings.FORECAST_HISTORY_DAYS)).ceil("h")
+        read_only = not settings.INFLUX_WRITES_ENABLED
+        if read_only:
+            cached = self._memory_hourly_cache.get((pump_id, profile_version), pd.DataFrame())
+        else:
+            cached = self.get_cached_hourly_forecast_dataframe(pump_id, profile_version, "-90d")
         latest = pd.to_datetime(cached["_time"].max(), utc=True, errors="coerce") if not cached.empty else pd.NaT
         if pd.isna(latest):
             boundary = oldest_complete_hour
         else:
             reprocess = timedelta(hours=max(0, int(settings.FORECAST_HOURLY_REPROCESS_HOURS)))
             boundary = max(latest.floor("h") - reprocess, oldest_complete_hour)
-        lookback_hours = min(2160, max(1, math.ceil((now - boundary).total_seconds() / 3600) + 1))
+        lookback_hours = min(settings.FORECAST_HISTORY_DAYS * 24, max(1, math.ceil((now - boundary).total_seconds() / 3600) + 1))
         raw = self.get_wide_dataframe(pump_id, start=f"-{lookback_hours}h")
         if not raw.empty:
             raw = raw.loc[pd.to_datetime(raw["_time"], utc=True, errors="coerce") >= boundary].reset_index(drop=True)
         updated = self.prepare_hourly_forecast_dataframe(raw, profile)
+        if read_only:
+            frames = [frame for frame in (cached, updated) if not frame.empty]
+            merged = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            if not merged.empty:
+                merged["_time"] = pd.to_datetime(merged["_time"], utc=True, errors="coerce")
+                merged = (merged.dropna(subset=["_time"]).drop_duplicates("_time", keep="last")
+                          .loc[lambda frame: frame["_time"] >= oldest_complete_hour].sort_values("_time").reset_index(drop=True))
+            self._memory_hourly_cache[(pump_id, profile_version)] = merged
+            return merged
         self.write_hourly_forecast_dataframe(pump_id, profile_version, updated)
         return self.get_cached_hourly_forecast_dataframe(pump_id, profile_version, "-90d")
